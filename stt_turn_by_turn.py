@@ -1099,6 +1099,38 @@ def load_qwen3_asr(
     return model, tokenizer, feature_extractor
 
 
+_REPETITION_THRESHOLD = 20
+
+
+def _detect_repetition(tokens: list[int]) -> bool:
+    """Detect degenerate token loops (single-token runs or short patterns)."""
+    if len(tokens) < _REPETITION_THRESHOLD:
+        return False
+    # Single token repeated consecutively.
+    count = 1
+    for i in range(len(tokens) - 1, 0, -1):
+        if tokens[i] == tokens[i - 1]:
+            count += 1
+            if count >= _REPETITION_THRESHOLD:
+                return True
+        else:
+            break
+    # Pattern of 2-10 tokens repeating.
+    for plen in range(2, min(11, len(tokens) // 2 + 1)):
+        pattern = tokens[-plen:]
+        reps = 1
+        pos = len(tokens) - plen * 2
+        while pos >= 0:
+            if tokens[pos:pos + plen] == pattern:
+                reps += 1
+                pos -= plen
+            else:
+                break
+        if reps >= max(2, _REPETITION_THRESHOLD // plen):
+            return True
+    return False
+
+
 def transcribe(
         model: Qwen3ASRModel,
         tokenizer: TokenizerLike,
@@ -1154,6 +1186,7 @@ def transcribe(
     prompt_ids = input_ids[0] if input_ids.ndim > 1 else input_ids
 
     eos_token_ids = [151645, 151643]
+    recent_tokens: list[int] = []
 
     for token, _ in generate_step(
             prompt=prompt_ids,
@@ -1162,6 +1195,11 @@ def transcribe(
             max_tokens=max_tokens,
     ):
         if token in eos_token_ids:
+            break
+        recent_tokens.append(token)
+        # Stop if a single token repeats 20+ times or a 2-10 token pattern
+        # loops excessively — prevents infinite generation on stuck patterns.
+        if _detect_repetition(recent_tokens):
             break
         yield tokenizer.decode([int(token)])
 
