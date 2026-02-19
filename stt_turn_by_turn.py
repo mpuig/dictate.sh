@@ -9,6 +9,8 @@
 #     "huggingface_hub",
 #     "rich",
 #     "onnxruntime",
+#     "pyannote.audio",
+#     "torch",
 # ]
 # ///
 """
@@ -38,6 +40,8 @@ Usage:
     uv run stt_turn_by_turn.py
     uv run stt_turn_by_turn.py --model mlx-community/Qwen3-ASR-1.7B-8bit
     uv run stt_turn_by_turn.py --turn-check   # enable LLM layer 3
+    uv run stt_turn_by_turn.py --intent       # extract intent JSON per turn
+    uv run stt_turn_by_turn.py --diarization  # enable diarization (if available)
     uv run stt_turn_by_turn.py --smart-turn-threshold 0.6
 
 Models (MLX Qwen3-ASR):
@@ -46,7 +50,7 @@ Models (MLX Qwen3-ASR):
     - mlx-community/Qwen3-ASR-0.6B-bf16: higher quality, more RAM.
     - mlx-community/Qwen3-ASR-1.7B-8bit: higher quality, slower.
 
-LLM models for --llm-model (used by --turn-check; availability may change):
+LLM models for --llm-model (used by --turn-check/--intent; availability may change):
     - mlx-community/Qwen3-0.6B-4bit: fastest, lowest RAM (default).
     - mlx-community/Qwen3-1.7B-4bit: better quality, slower.
     - mlx-community/Mistral-7B-Instruct-v0.2-4bit: heavier.
@@ -104,6 +108,7 @@ from rich.logging import RichHandler  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
+
 
 # -----------------------------------------------------------------------------
 # Defaults
@@ -253,7 +258,9 @@ class UIState:
 
     status: str = "Starting"
     partial: str = ""
-    history: List[str] = field(default_factory=list)
+    history: List[Tuple[str, Optional[Dict[str, Any]], Optional[str]]] = field(
+        default_factory=list
+    )
     max_history: int = 50
     vad_state: str = "silence"
     vad_prob: Optional[float] = None
@@ -263,6 +270,8 @@ class UIState:
     smart_turn_prob: Optional[float] = None
     smart_turn_ms: Optional[float] = None
     turn_check_result: Optional[str] = None
+    intent_ms: Optional[float] = None
+    diarization_ms: Optional[float] = None
     wait_remaining: Optional[float] = None
     dropped_frames: int = 0
 
@@ -282,15 +291,33 @@ def _replace_audio_embeddings(
 
     Pure MLX — no numpy conversion, no host sync.
     """
-    audio_mask = input_ids == audio_token_id  # (B, L)
+    audio_mask = input_ids == audio_token_id  # (B, L) or (L,)
+
+    if input_ids.ndim == 1:
+        audio_mask = audio_mask[None, :]
+        inputs_embeds = inputs_embeds[None, :, :]
+
+    if audio_features.ndim == 2:
+        audio_features = audio_features[None, :, :]
+
+    if audio_features.ndim != 3 or inputs_embeds.ndim != 3:
+        return inputs_embeds
+
     # Cumulative index: maps each audio placeholder to its feature vector.
     cum_idx = mx.cumsum(audio_mask.astype(mx.int32), axis=-1) - 1
     cum_idx = mx.maximum(cum_idx, 0)  # (B, L)
 
     audio_features = audio_features.astype(inputs_embeds.dtype)
+    if audio_features.shape[0] == 1 and audio_mask.shape[0] > 1:
+        audio_features = mx.broadcast_to(
+            audio_features, (audio_mask.shape[0],) + audio_features.shape[1:]
+        )
+
     # Gather audio features at every position, then select via mask.
-    audio_expanded = audio_features[0, cum_idx[0]]  # (L, D) — batch=1
-    audio_expanded = audio_expanded[None, :, :]  # (1, L, D)
+    expanded_parts = []
+    for b in range(int(audio_mask.shape[0])):
+        expanded_parts.append(audio_features[b, cum_idx[b]])  # (L, D)
+    audio_expanded = mx.stack(expanded_parts, axis=0)  # (B, L, D)
     mask_3d = audio_mask[:, :, None]  # (B, L, 1)
     return mx.where(mask_3d, audio_expanded, inputs_embeds)
 
@@ -354,7 +381,7 @@ class SmartTurnAnalyzer:
             return_tensors="np",
             padding="max_length",
             max_length=SMART_TURN_DEFAULTS.audio_seconds
-            * SMART_TURN_DEFAULTS.sample_rate,
+                       * SMART_TURN_DEFAULTS.sample_rate,
             truncation=True,
             do_normalize=True,
         )
@@ -1196,6 +1223,53 @@ TURN_CHECK_PROMPT = """You are a speech turn-completion classifier. Given a tran
 
 Transcript: "{text}" /no_think"""
 
+INTENT_SCHEMA_JSON = """{
+  "$id": "https://example.com/intent-classification.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IntentClassification",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "intent": {
+      "type": "string",
+      "enum": [
+        "inform",
+        "question",
+        "evaluate",
+        "request_action",
+        "complaint",
+        "other"
+      ],
+      "description": "Primary communicative intent of the user input."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "One short sentence starting with a verb that describes the user's communicative action."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model confidence score between 0 and 1."
+    }
+  },
+  "required": [
+    "intent",
+    "description"
+  ]
+}"""
+
+INTENT_PROMPT = """You are an intent classifier. Return ONLY a JSON object that matches the schema.
+Use double quotes, no trailing commas, and no extra keys.
+Ensure description starts with a verb and is <= 120 characters.
+
+Schema:
+{schema}
+
+Transcript: "{text}"
+/no_think"""
+
 
 class RealtimeTranscriber:
     """Encapsulates the async pipeline so capture, VAD, Smart Turn, and ASR stay coordinated."""
@@ -1208,6 +1282,8 @@ class RealtimeTranscriber:
             vad_silence_ms: int = VAD_DEFAULTS.silence_ms,
             min_words: int = ASR_DEFAULTS.min_words,
             turn_check: bool = False,
+            intent: bool = False,
+            diarization: bool = False,
             llm_model: Optional[str] = None,
             device: Optional[int] = None,
             no_ui: bool = False,
@@ -1221,6 +1297,8 @@ class RealtimeTranscriber:
         self.vad_silence_ms = vad_silence_ms
         self.min_words = min_words
         self.turn_check = turn_check
+        self.intent = intent
+        self.diarization = diarization
         self.llm_model_name = llm_model or ASR_DEFAULTS.llm_model
         self.device = device
         self.no_ui = no_ui
@@ -1241,6 +1319,8 @@ class RealtimeTranscriber:
         self.llm = None
         self.llm_tokenizer: Optional[TokenizerLike] = None
         self.smart_turn: Optional[SmartTurnAnalyzer] = None
+        self.diarizer = None
+        self.diarization_label_map: Dict[str, str] = {}
 
         # Ring buffer avoids reallocations; int16 matches the input stream.
         self.max_buffer_samples = int(self.max_buffer_seconds * self.sample_rate)
@@ -1250,6 +1330,7 @@ class RealtimeTranscriber:
             buffer=np.zeros(self.max_buffer_samples, dtype=np.int16),
         )
         self.last_transcribed_sample = 0
+        self.last_turn_sample = 0
         self.buffer_lock = asyncio.Lock()
 
         # MLX is not re-entrant; serialize GPU work to avoid races.
@@ -1270,7 +1351,9 @@ class RealtimeTranscriber:
         self.current_transcript = ""
         self.last_transcript = ""
         self.turn_complete = False
-        self.pending_turn: Optional[str] = None
+        self.pending_turn: Optional[
+            Tuple[str, Optional[Dict[str, Any]], Optional[str]]
+        ] = None
 
         # Wait-state for LLM turn-check incomplete results.
         self._wait_cancel = asyncio.Event()
@@ -1278,13 +1361,14 @@ class RealtimeTranscriber:
 
         # Rich UI state (stderr) + clean transcript output (stdout).
         self.console_out = Console()
-        self.console_ui = Console(stderr=True, force_terminal=True)
+        self.console_ui = Console(stderr=True, force_terminal=True, force_interactive=True)
         self.live: Optional[Live] = None
         self.ui = UIState()
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Keep callback lightweight by deferring work to the async loop."""
         data = indata.reshape(-1).copy()
+
         def enqueue():
             if self.audio_queue.full():
                 self.ui.dropped_frames += 1
@@ -1310,23 +1394,52 @@ class RealtimeTranscriber:
         status.append("VAD: Silero")
         status.append(" | ")
         status.append(f"ASR: {self._short_model_name(self.model_path)}")
-        if self.turn_check:
+        if self.turn_check or self.intent:
             status.append(" | ")
             status.append(f"LLM: {self._short_model_name(self.llm_model_name)}")
+        if self.diarization:
+            status.append(" | ")
+            status.append("Diarization: on")
         return Panel(status, title="Status", padding=(0, 1))
 
     def _render_transcript_panel(self) -> Panel:
-        body = Text()
-        for transcript in self.ui.history[-self.ui.max_history:]:
-            body.append("> ", style="bold green")
-            body.append(transcript)
-            body.append("\n\n")
+        lines: List[Tuple[str, Optional[str]]] = []
+
+        def add_line(text: str, style: Optional[str] = None) -> None:
+            lines.append((text, style))
+
+        for transcript, intent, speaker in self.ui.history[-self.ui.max_history:]:
+            add_line(f"> {transcript}", "bold green")
+            if speaker:
+                add_line(f"Speaker: {speaker}", "magenta")
+            if intent:
+                intent_name = intent.get("intent", "")
+                intent_desc = intent.get("description", "")
+                intent_conf = intent.get("confidence", None)
+                if intent_name:
+                    add_line(f"Intent: {intent_name}", "cyan")
+                if intent_desc:
+                    add_line(f"Description: {intent_desc}", "cyan")
+                if intent_conf is not None:
+                    add_line(f"Confidence: {intent_conf:.2f}", "cyan")
+            add_line("")
+
         if self.ui.partial and not self.turn_complete:
-            body.append("... ", style="dim")
-            body.append(self.ui.partial, style="dim")
+            add_line(f"... {self.ui.partial}", "dim")
+
+        if not lines:
+            add_line("Waiting for speech...", "dim")
+
+        term_lines = shutil.get_terminal_size(fallback=(80, 24)).lines
+        reserved = 3 + 9 + 4  # status + stats + panel borders
+        max_lines = max(5, term_lines - reserved)
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+
+        body = Text()
+        for text, style in lines:
+            body.append(text, style=style)
             body.append("\n")
-        if not body.plain:
-            body.append("Waiting for speech...", style="dim")
         return Panel(body, title="Transcript", padding=(0, 1))
 
     def _render_stats_panel(self) -> Panel:
@@ -1359,6 +1472,18 @@ class RealtimeTranscriber:
         if self.turn_check:
             tc_text = self.ui.turn_check_result or "--"
             stats.add_row("Turn Check", tc_text)
+        if self.intent:
+            stats.add_row(
+                "Intent",
+                f"{self.ui.intent_ms:.0f} ms" if self.ui.intent_ms is not None else "--",
+            )
+        if self.diarization:
+            stats.add_row(
+                "Diarization",
+                f"{self.ui.diarization_ms:.0f} ms"
+                if self.ui.diarization_ms is not None
+                else "--",
+            )
         # Wait state countdown.
         if self.ui.wait_remaining is not None:
             stats.add_row("Wait", f"{self.ui.wait_remaining:.1f}s")
@@ -1418,6 +1543,33 @@ class RealtimeTranscriber:
         first = buf.max_samples - start
         out[:first] = buf.buffer[start:]
         out[first:] = buf.buffer[: end % buf.max_samples]
+        return out
+
+    def _get_audio_window(self, start_sample: int, end_sample: int) -> np.ndarray:
+        """Return audio between global sample indices [start_sample, end_sample)."""
+        buf = self.buffer
+        if buf.filled == 0:
+            return EMPTY_INT16
+
+        end_sample = min(end_sample, buf.total_written)
+        earliest = buf.total_written - buf.filled
+        start_sample = max(start_sample, earliest)
+        if end_sample <= start_sample:
+            return EMPTY_INT16
+
+        num = end_sample - start_sample
+        start_offset = (buf.write_pos - buf.filled) % buf.max_samples
+        rel = start_sample - earliest
+        start_idx = (start_offset + rel) % buf.max_samples
+
+        out = np.empty(num, dtype=np.int16)
+        end_idx = start_idx + num
+        if end_idx <= buf.max_samples:
+            out[:] = buf.buffer[start_idx:end_idx]
+            return out
+        first = buf.max_samples - start_idx
+        out[:first] = buf.buffer[start_idx:]
+        out[first:] = buf.buffer[: end_idx % buf.max_samples]
         return out
 
     def _reset_audio_state(self) -> None:
@@ -1520,6 +1672,151 @@ class RealtimeTranscriber:
         # Fallback: treat as complete if we can't parse the marker.
         return "\u2713"
 
+    def _parse_intent_payload(self, text: str) -> Optional[Dict[str, Any]]:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            payload = json.loads(text[start: end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        allowed = {"intent", "description", "confidence"}
+        if any(key not in allowed for key in payload.keys()):
+            return None
+
+        intent = payload.get("intent")
+        description = payload.get("description")
+        if not isinstance(intent, str) or not isinstance(description, str):
+            return None
+
+        intent = intent.strip()
+        description = description.strip()
+        if intent not in {
+            "inform",
+            "question",
+            "evaluate",
+            "request_action",
+            "complaint",
+            "other",
+        }:
+            return None
+        if not description:
+            return None
+        if len(description) > 120:
+            description = description[:120].rstrip()
+
+        confidence = payload.get("confidence", None)
+        if confidence is not None:
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                confidence = None
+            if confidence is not None and not (0.0 <= confidence <= 1.0):
+                confidence = None
+
+        result = {"intent": intent, "description": description}
+        if confidence is not None:
+            result["confidence"] = confidence
+        return result
+
+    def _classify_intent(self, text: str) -> Dict[str, Any]:
+        """Classify intent using structured JSON output."""
+        from mlx_lm.generate import generate
+
+        messages = [
+            {
+                "role": "user",
+                "content": INTENT_PROMPT.format(schema=INTENT_SCHEMA_JSON, text=text),
+            }
+        ]
+        prompt = self.llm_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        with _suppress_output():
+            response = generate(
+                self.llm, self.llm_tokenizer, prompt, max_tokens=200, verbose=False
+            )
+
+        response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+        response = response.strip()
+        parsed = self._parse_intent_payload(response)
+        if parsed is not None:
+            return parsed
+
+        return {"intent": "other", "description": "Respond to the user.", "confidence": 0.0}
+
+    def _load_diarizer(self):
+        """Load pyannote diarization pipeline if enabled."""
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError as exc:
+            raise ImportError(
+                "Diarization requires 'pyannote.audio'. Install with: "
+                "pip install pyannote.audio"
+            ) from exc
+
+        token = (
+                os.environ.get("PYANNOTE_AUTH_TOKEN")
+                or os.environ.get("HUGGINGFACE_TOKEN")
+                or os.environ.get("HF_TOKEN")
+                or ""
+        )
+        model_id = os.environ.get(
+            "PYANNOTE_MODEL_ID", "pyannote/speaker-diarization-3.1"
+        )
+        kwargs = {}
+        if token:
+            # pyannote has used both `use_auth_token` and `token` across versions.
+            try:
+                self.diarizer = Pipeline.from_pretrained(
+                    model_id, use_auth_token=token
+                )
+                return
+            except TypeError:
+                kwargs["token"] = token
+        self.diarizer = Pipeline.from_pretrained(model_id, **kwargs)
+
+    def _normalize_speaker_label(self, label: str) -> str:
+        if label not in self.diarization_label_map:
+            self.diarization_label_map[label] = (
+                f"SPEAKER_{len(self.diarization_label_map):02d}"
+            )
+        return self.diarization_label_map[label]
+
+    def _infer_speaker(self, audio_int16: np.ndarray) -> Optional[str]:
+        """Run diarization and return dominant speaker label."""
+        if audio_int16.size == 0 or self.diarizer is None:
+            return None
+        audio_float = _int16_to_float32(audio_int16)
+        try:
+            import torch
+        except ImportError as exc:
+            raise ImportError(
+                "Diarization requires PyTorch (torch). Install with: "
+                "pip install torch"
+            ) from exc
+
+        waveform = torch.from_numpy(audio_float).unsqueeze(0)
+        diarization = self.diarizer(
+            {"waveform": waveform, "sample_rate": self.sample_rate}
+        )
+        durations: Dict[str, float] = {}
+        if hasattr(diarization, "itertracks"):
+            for segment, _, label in diarization.itertracks(yield_label=True):
+                start = float(getattr(segment, "start", 0.0))
+                end = float(getattr(segment, "end", start))
+                if end <= start:
+                    continue
+                norm_label = self._normalize_speaker_label(str(label))
+                durations[norm_label] = durations.get(norm_label, 0.0) + (end - start)
+        if not durations:
+            return None
+        return max(durations.items(), key=lambda kv: kv[1])[0]
+
     async def _enter_wait_state(self, timeout: float) -> bool:
         """Wait for timeout, cancellable by speech resumption.
 
@@ -1558,7 +1855,38 @@ class RealtimeTranscriber:
 
     async def _finalize_turn(self, final_transcript: str) -> None:
         """Emit a final turn result and reset state for the next turn."""
-        self.pending_turn = final_transcript
+        intent_result = None
+        speaker_label = None
+
+        diarization_audio = EMPTY_INT16
+        async with self.buffer_lock:
+            end_sample = self.buffer.total_written
+            if self.diarization:
+                diarization_audio = self._get_audio_window(
+                    self.last_turn_sample, end_sample
+                )
+            self.last_turn_sample = end_sample
+
+        if self.diarization:
+            self.ui.status = "Diarizing"
+            self._update_ui()
+            start = time.perf_counter()
+            speaker_label = await asyncio.to_thread(
+                self._infer_speaker, diarization_audio
+            )
+            self.ui.diarization_ms = (time.perf_counter() - start) * 1000
+
+        if self.intent:
+            self.ui.status = "Intent"
+            self._update_ui()
+            async with self.gpu_lock:
+                start = time.perf_counter()
+                intent_result = await asyncio.to_thread(
+                    self._classify_intent, final_transcript
+                )
+                self.ui.intent_ms = (time.perf_counter() - start) * 1000
+
+        self.pending_turn = (final_transcript, intent_result, speaker_label)
         self.last_transcript = final_transcript
         self.current_transcript = ""
         self.ui.status = "Listening"
@@ -1735,10 +2063,10 @@ class RealtimeTranscriber:
             await asyncio.sleep(0.1)
 
             if self.pending_turn:
-                transcript = self.pending_turn
+                transcript, intent, speaker = self.pending_turn
                 self.pending_turn = None
 
-                self.ui.history.append(transcript)
+                self.ui.history.append((transcript, intent, speaker))
                 self.ui.partial = ""
                 self._update_ui(force=True)
 
@@ -1748,6 +2076,23 @@ class RealtimeTranscriber:
                 elif not self.live:
                     sys.stdout.write("\r\033[K")
                     self.console_out.print(f"[bold green]>[/bold green] {transcript}")
+                    if speaker:
+                        self.console_out.print(
+                            f"  [magenta]Speaker:[/magenta] {speaker}"
+                        )
+                    if intent:
+                        self.console_out.print(
+                            f"  [cyan]Intent:[/cyan] {intent.get('intent', '')}"
+                        )
+                        self.console_out.print(
+                            f"  [cyan]Description:[/cyan] {intent.get('description', '')}"
+                        )
+                        conf = intent.get("confidence", None)
+                        if isinstance(conf, (int, float)):
+                            self.console_out.print(
+                                f"  [cyan]Confidence:[/cyan] {conf:.2f}"
+                            )
+                        self.console_out.print()
 
                 last_displayed = ""
                 continue
@@ -1823,7 +2168,13 @@ class RealtimeTranscriber:
             SmartTurnAnalyzer, self.smart_turn_threshold
         )
 
-        if self.turn_check:
+        if self.diarization:
+            self.ui.status = "Loading Diarization..."
+            self._update_ui(force=True)
+            self._log_info("Loading diarization pipeline...")
+            await asyncio.to_thread(self._load_diarizer)
+
+        if self.turn_check or self.intent:
             self.ui.status = "Loading LLM..."
             self._update_ui(force=True)
             self._log_info("Loading LLM...")
@@ -1850,6 +2201,10 @@ class RealtimeTranscriber:
         info += f" | Smart Turn: threshold {self.smart_turn_threshold}"
         if self.turn_check:
             info += " | Turn Check: enabled"
+        if self.intent:
+            info += " | Intent: enabled"
+        if self.diarization:
+            info += " | Diarization: enabled"
         self._log_info("Ready - %s", info)
         self._log_info("Listening... (Ctrl+C to stop)")
         self.ui.status = "Listening"
@@ -1955,6 +2310,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Enable LLM turn-completion check (layer 3)",
     )
     parser.add_argument(
+        "--intent",
+        action="store_true",
+        help="Enable LLM intent classification per finalized turn",
+    )
+    parser.add_argument(
+        "--diarization",
+        action="store_true",
+        help="Enable diarization (requires additional setup if available)",
+    )
+    parser.add_argument(
         "--incomplete-short-timeout",
         type=float,
         default=SMART_TURN_DEFAULTS.incomplete_short_timeout,
@@ -1972,7 +2337,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             f"(default: {SMART_TURN_DEFAULTS.incomplete_long_timeout}s)"
         ),
     )
-    parser.add_argument("--llm-model", default=None, help="LLM model for turn-check")
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="LLM model for --turn-check/--intent",
+    )
     parser.add_argument(
         "--no-ui", action="store_true", help="Disable the Rich live UI"
     )
@@ -2029,6 +2398,8 @@ def _main() -> int:
         vad_silence_ms=args.vad_silence_ms,
         min_words=args.min_words,
         turn_check=args.turn_check,
+        intent=args.intent,
+        diarization=args.diarization,
         llm_model=args.llm_model,
         device=args.device,
         no_ui=args.no_ui,
