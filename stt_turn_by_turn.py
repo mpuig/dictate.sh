@@ -278,31 +278,21 @@ def _replace_audio_embeddings(
         audio_features: mx.array,
         audio_token_id: int,
 ) -> mx.array:
-    """Replace audio token embeddings with audio features."""
+    """Replace audio placeholder embeddings with encoded audio features.
+
+    Pure MLX — no numpy conversion, no host sync.
+    """
+    audio_mask = input_ids == audio_token_id  # (B, L)
+    # Cumulative index: maps each audio placeholder to its feature vector.
+    cum_idx = mx.cumsum(audio_mask.astype(mx.int32), axis=-1) - 1
+    cum_idx = mx.maximum(cum_idx, 0)  # (B, L)
+
     audio_features = audio_features.astype(inputs_embeds.dtype)
-    audio_token_mask = input_ids == audio_token_id
-    if not audio_token_mask.any():
-        return inputs_embeds
-
-    batch_size, seq_len, hidden_dim = inputs_embeds.shape
-    flat_mask_np = np.array(audio_token_mask.reshape(-1))
-    audio_indices = np.nonzero(flat_mask_np)[0]
-    if len(audio_indices) == 0 or audio_features.shape[0] == 0:
-        return inputs_embeds
-
-    num_to_replace = min(len(audio_indices), audio_features.shape[0])
-    flat_embeds = inputs_embeds.reshape(-1, hidden_dim)
-    indices = mx.array(audio_indices[:num_to_replace])
-    replacement = (
-        mx.zeros_like(flat_embeds).at[indices].add(audio_features[:num_to_replace])
-    )
-    mask = (
-        mx.zeros((flat_embeds.shape[0],), dtype=flat_embeds.dtype)
-        .at[indices]
-        .add(1)
-    )
-    flat_embeds = mx.where(mask[:, None] > 0, replacement, flat_embeds)
-    return flat_embeds.reshape(batch_size, seq_len, hidden_dim)
+    # Gather audio features at every position, then select via mask.
+    audio_expanded = audio_features[0, cum_idx[0]]  # (L, D) — batch=1
+    audio_expanded = audio_expanded[None, :, :]  # (1, L, D)
+    mask_3d = audio_mask[:, :, None]  # (B, L, 1)
+    return mx.where(mask_3d, audio_expanded, inputs_embeds)
 
 
 class SmartTurnAnalyzer:
@@ -1171,16 +1161,11 @@ def transcribe(
     )
     input_ids = mx.array(tokenizer.encode(prompt, return_tensors="np"))
 
-    # Compute audio features once for embedding replacement.
     audio_features = model.get_audio_features(input_features, feature_attention_mask)
-    mx.eval(audio_features)
-
-    # Replace audio token embeddings with audio features.
     inputs_embeds = model.model.embed_tokens(input_ids)
     inputs_embeds = _replace_audio_embeddings(
         inputs_embeds, input_ids, audio_features, model.config.audio_token_id
     )
-
     mx.eval(inputs_embeds)
     input_embeddings = inputs_embeds[0]
     prompt_ids = input_ids[0] if input_ids.ndim > 1 else input_ids
