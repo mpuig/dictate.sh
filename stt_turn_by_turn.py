@@ -109,21 +109,50 @@ from rich.text import Text  # noqa: E402
 # Defaults
 # -----------------------------------------------------------------------------
 
-DEFAULT_ASR_MODEL = "mlx-community/Qwen3-ASR-0.6B-8bit"
-DEFAULT_LLM_MODEL = "mlx-community/Qwen3-0.6B-4bit"
-DEFAULT_LANGUAGE = "English"
-DEFAULT_SAMPLE_RATE = 16000
-DEFAULT_TRANSCRIBE_INTERVAL = 0.5
-DEFAULT_VAD_SILENCE_MS = 200
-DEFAULT_MIN_WORDS = 3
-DEFAULT_MAX_BUFFER_SECONDS = 30
-DEFAULT_AUDIO_QUEUE_MAXSIZE = 200
 
-DEFAULT_SMART_TURN_THRESHOLD = 0.5
-DEFAULT_INCOMPLETE_SHORT_TIMEOUT = 5.0
-DEFAULT_INCOMPLETE_LONG_TIMEOUT = 10.0
-SMART_TURN_AUDIO_SECONDS = 8
-SMART_TURN_SAMPLE_RATE = 16000
+@dataclass(frozen=True)
+class ASRDefaults:
+    model: str = "mlx-community/Qwen3-ASR-0.6B-8bit"
+    llm_model: str = "mlx-community/Qwen3-0.6B-4bit"
+    language: str = "English"
+    sample_rate: int = 16000
+    transcribe_interval: float = 0.5
+    min_words: int = 3
+    max_buffer_seconds: int = 30
+    audio_queue_maxsize: int = 200
+
+
+@dataclass(frozen=True)
+class VADDefaults:
+    silence_ms: int = 200
+    window: int = 512  # 32ms at 16kHz
+    context: int = 64
+    threshold: float = 0.5
+
+
+@dataclass(frozen=True)
+class SmartTurnDefaults:
+    threshold: float = 0.5
+    incomplete_short_timeout: float = 5.0
+    incomplete_long_timeout: float = 10.0
+    audio_seconds: int = 8
+    sample_rate: int = 16000
+
+
+ASR_DEFAULTS = ASRDefaults()
+VAD_DEFAULTS = VADDefaults()
+SMART_TURN_DEFAULTS = SmartTurnDefaults()
+
+INT16_SCALE = 1.0 / 32768.0
+EMPTY_INT16 = np.array([], dtype=np.int16)
+
+ASR_PROMPT_PREFIX = (
+    "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>"
+)
+ASR_PROMPT_SUFFIX_TEMPLATE = (
+    "<|audio_end|><|im_end|>\n<|im_start|>assistant\nlanguage {lang}<asr_text>"
+)
+GPU_BUSY_COOLDOWN = 0.15
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -147,6 +176,21 @@ def _suppress_output():
         os.dup2(stderr_fd, 2)
         os.close(stderr_fd)
         os.close(devnull)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Public CLI builder wrapper (implementation lives below)."""
+    return _build_arg_parser()
+
+
+def list_audio_devices() -> None:
+    """Public device lister wrapper (implementation lives below)."""
+    _list_audio_devices()
+
+
+def main() -> int:
+    """Public CLI entrypoint wrapper (implementation lives below)."""
+    return _main()
 
 
 # -----------------------------------------------------------------------------
@@ -179,9 +223,86 @@ class FeatureExtractorLike(Protocol):
     ) -> Dict[str, Any]: ...
 
 
-# =============================================================================
-# Smart Turn ONNX Analyzer
-# =============================================================================
+@dataclass
+class BufferState:
+    """Ring buffer bookkeeping for audio capture."""
+
+    max_samples: int
+    sample_rate: int
+    buffer: np.ndarray
+    write_pos: int = 0
+    filled: int = 0
+    total_written: int = 0
+
+
+@dataclass
+class VADState:
+    """State tracking for Silero VAD windowing."""
+
+    frame_samples: int
+    silence_frames: int
+    buffer: np.ndarray
+    buffer_fill: int = 0
+    speech_detected: bool = False
+    silence_count: int = 0
+
+
+@dataclass
+class UIState:
+    """Live UI fields to keep rendering logic cohesive."""
+
+    status: str = "Starting"
+    partial: str = ""
+    history: List[str] = field(default_factory=list)
+    max_history: int = 50
+    vad_state: str = "silence"
+    vad_prob: Optional[float] = None
+    buffer_seconds: float = 0.0
+    queue_size: int = 0
+    asr_ms: Optional[float] = None
+    smart_turn_prob: Optional[float] = None
+    smart_turn_ms: Optional[float] = None
+    turn_check_result: Optional[str] = None
+    wait_remaining: Optional[float] = None
+    dropped_frames: int = 0
+
+
+def _int16_to_float32(audio_int16: np.ndarray) -> np.ndarray:
+    """Normalize int16 PCM to float32 [-1, 1]."""
+    return audio_int16.astype(np.float32) * INT16_SCALE
+
+
+def _replace_audio_embeddings(
+        inputs_embeds: mx.array,
+        input_ids: mx.array,
+        audio_features: mx.array,
+        audio_token_id: int,
+) -> mx.array:
+    """Replace audio token embeddings with audio features."""
+    audio_features = audio_features.astype(inputs_embeds.dtype)
+    audio_token_mask = input_ids == audio_token_id
+    if not audio_token_mask.any():
+        return inputs_embeds
+
+    batch_size, seq_len, hidden_dim = inputs_embeds.shape
+    flat_mask_np = np.array(audio_token_mask.reshape(-1))
+    audio_indices = np.nonzero(flat_mask_np)[0]
+    if len(audio_indices) == 0 or audio_features.shape[0] == 0:
+        return inputs_embeds
+
+    num_to_replace = min(len(audio_indices), audio_features.shape[0])
+    flat_embeds = inputs_embeds.reshape(-1, hidden_dim)
+    indices = mx.array(audio_indices[:num_to_replace])
+    replacement = (
+        mx.zeros_like(flat_embeds).at[indices].add(audio_features[:num_to_replace])
+    )
+    mask = (
+        mx.zeros((flat_embeds.shape[0],), dtype=flat_embeds.dtype)
+        .at[indices]
+        .add(1)
+    )
+    flat_embeds = mx.where(mask[:, None] > 0, replacement, flat_embeds)
+    return flat_embeds.reshape(batch_size, seq_len, hidden_dim)
 
 
 class SmartTurnAnalyzer:
@@ -197,7 +318,7 @@ class SmartTurnAnalyzer:
     N_MELS = 80
     N_FRAMES = 800
 
-    def __init__(self, threshold: float = DEFAULT_SMART_TURN_THRESHOLD):
+    def __init__(self, threshold: float = SMART_TURN_DEFAULTS.threshold):
         import onnxruntime as ort
         from huggingface_hub import hf_hub_download
         from transformers import WhisperFeatureExtractor
@@ -215,11 +336,13 @@ class SmartTurnAnalyzer:
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(model_path, sess_options=so)
 
-        self.feature_extractor = WhisperFeatureExtractor(chunk_length=8)
+        self.feature_extractor = WhisperFeatureExtractor(
+            chunk_length=SMART_TURN_DEFAULTS.audio_seconds
+        )
 
     def _prepare_audio(self, audio_float32: np.ndarray) -> np.ndarray:
         """Truncate to last 8s or zero-pad at the beginning if shorter."""
-        max_samples = SMART_TURN_AUDIO_SECONDS * SMART_TURN_SAMPLE_RATE
+        max_samples = SMART_TURN_DEFAULTS.audio_seconds * SMART_TURN_DEFAULTS.sample_rate
         if len(audio_float32) > max_samples:
             return audio_float32[-max_samples:]
         elif len(audio_float32) < max_samples:
@@ -237,10 +360,11 @@ class SmartTurnAnalyzer:
 
         inputs = self.feature_extractor(
             audio,
-            sampling_rate=SMART_TURN_SAMPLE_RATE,
+            sampling_rate=SMART_TURN_DEFAULTS.sample_rate,
             return_tensors="np",
             padding="max_length",
-            max_length=SMART_TURN_AUDIO_SECONDS * SMART_TURN_SAMPLE_RATE,
+            max_length=SMART_TURN_DEFAULTS.audio_seconds
+            * SMART_TURN_DEFAULTS.sample_rate,
             truncation=True,
             do_normalize=True,
         )
@@ -258,14 +382,9 @@ class SmartTurnAnalyzer:
         return {"prediction": prediction, "probability": probability}
 
 
-# =============================================================================
-# Silero VAD
-# =============================================================================
-
-
-SILERO_VAD_WINDOW = 512  # 32ms at 16kHz
-SILERO_VAD_CONTEXT = 64
-SILERO_VAD_THRESHOLD = 0.5
+SILERO_VAD_WINDOW = VAD_DEFAULTS.window
+SILERO_VAD_CONTEXT = VAD_DEFAULTS.context
+SILERO_VAD_THRESHOLD = VAD_DEFAULTS.threshold
 
 
 class SileroVAD:
@@ -307,11 +426,6 @@ class SileroVAD:
         self._state = outs[1]
         self._context = audio_chunk_f32[-SILERO_VAD_CONTEXT:]
         return prob
-
-
-# =============================================================================
-# Configuration Classes
-# =============================================================================
 
 
 @dataclass
@@ -372,11 +486,6 @@ class ModelConfig:
                     if k in TextConfig.__dataclass_fields__
                 }
             )
-
-
-# =============================================================================
-# Model Architecture
-# =============================================================================
 
 
 def create_additive_causal_mask(N: int, offset: int = 0) -> mx.array:
@@ -855,28 +964,9 @@ class Qwen3ASRModel(nn.Module):
             audio_features = self.get_audio_features(
                 input_features, feature_attention_mask
             ).astype(inputs_embeds.dtype)
-            audio_token_mask = input_ids == self.config.audio_token_id
-
-            if audio_token_mask.any():
-                batch_size, seq_len, hidden_dim = inputs_embeds.shape
-                flat_mask_np = np.array(audio_token_mask.reshape(-1))
-                audio_indices = np.nonzero(flat_mask_np)[0]
-                if len(audio_indices) > 0 and audio_features.shape[0] > 0:
-                    num_to_replace = min(len(audio_indices), audio_features.shape[0])
-                    flat_embeds = inputs_embeds.reshape(-1, hidden_dim)
-                    indices = mx.array(audio_indices[:num_to_replace])
-                    replacement = (
-                        mx.zeros_like(flat_embeds)
-                        .at[indices]
-                        .add(audio_features[:num_to_replace])
-                    )
-                    mask = (
-                        mx.zeros((flat_embeds.shape[0],), dtype=flat_embeds.dtype)
-                        .at[indices]
-                        .add(1)
-                    )
-                    flat_embeds = mx.where(mask[:, None] > 0, replacement, flat_embeds)
-                    inputs_embeds = flat_embeds.reshape(batch_size, seq_len, hidden_dim)
+            inputs_embeds = _replace_audio_embeddings(
+                inputs_embeds, input_ids, audio_features, self.config.audio_token_id
+            )
 
         hidden_states = self.model(inputs_embeds=inputs_embeds, cache=cache)
         return (
@@ -916,11 +1006,6 @@ class Qwen3ASRModel(nn.Module):
                 v = v.transpose(0, 2, 3, 1)
             sanitized[k] = v
         return sanitized
-
-
-# =============================================================================
-# Model Loading
-# =============================================================================
 
 
 def load_qwen3_asr(
@@ -1014,17 +1099,12 @@ def load_qwen3_asr(
     return model, tokenizer, feature_extractor
 
 
-# =============================================================================
-# Transcription
-# =============================================================================
-
-
 def transcribe(
         model: Qwen3ASRModel,
         tokenizer: TokenizerLike,
         feature_extractor: FeatureExtractorLike,
         audio: np.ndarray,
-        language: str = "English",
+        language: str = ASR_DEFAULTS.language,
         max_tokens: int = 8192,
 ) -> Generator[str, None, None]:
     """Stream tokens to keep transcription latency low."""
@@ -1033,7 +1113,7 @@ def transcribe(
     # Match the model's expected feature pipeline.
     audio_inputs = feature_extractor(
         audio,
-        sampling_rate=16000,
+        sampling_rate=ASR_DEFAULTS.sample_rate,
         return_attention_mask=True,
         truncation=False,
         padding=True,
@@ -1052,10 +1132,10 @@ def transcribe(
     supported_lower = {lang.lower(): lang for lang in supported}
     lang_name = supported_lower.get(language.lower(), language)
 
+    audio_pad = "<|audio_pad|>" * num_audio_tokens
     prompt = (
-        f"<|im_start|>system\n<|im_end|>\n"
-        f"<|im_start|>user\n<|audio_start|>{'<|audio_pad|>' * num_audio_tokens}<|audio_end|><|im_end|>\n"
-        f"<|im_start|>assistant\nlanguage {lang_name}<asr_text>"
+        f"{ASR_PROMPT_PREFIX}{audio_pad}"
+        f"{ASR_PROMPT_SUFFIX_TEMPLATE.format(lang=lang_name)}"
     )
     input_ids = mx.array(tokenizer.encode(prompt, return_tensors="np"))
 
@@ -1065,30 +1145,9 @@ def transcribe(
 
     # Replace audio token embeddings with audio features.
     inputs_embeds = model.model.embed_tokens(input_ids)
-    audio_features = audio_features.astype(inputs_embeds.dtype)
-    audio_token_mask = input_ids == model.config.audio_token_id
-
-    if audio_token_mask.any():
-        batch_size, seq_len, hidden_dim = inputs_embeds.shape
-        flat_mask_np = np.array(audio_token_mask.reshape(-1))
-        audio_indices = np.nonzero(flat_mask_np)[0]
-
-        if len(audio_indices) > 0:
-            num_to_replace = min(len(audio_indices), audio_features.shape[0])
-            flat_embeds = inputs_embeds.reshape(-1, hidden_dim)
-            indices = mx.array(audio_indices[:num_to_replace])
-            replacement = (
-                mx.zeros_like(flat_embeds)
-                .at[indices]
-                .add(audio_features[:num_to_replace])
-            )
-            mask = (
-                mx.zeros((flat_embeds.shape[0],), dtype=flat_embeds.dtype)
-                .at[indices]
-                .add(1)
-            )
-            flat_embeds = mx.where(mask[:, None] > 0, replacement, flat_embeds)
-            inputs_embeds = flat_embeds.reshape(batch_size, seq_len, hidden_dim)
+    inputs_embeds = _replace_audio_embeddings(
+        inputs_embeds, input_ids, audio_features, model.config.audio_token_id
+    )
 
     mx.eval(inputs_embeds)
     input_embeddings = inputs_embeds[0]
@@ -1107,11 +1166,6 @@ def transcribe(
         yield tokenizer.decode([int(token)])
 
 
-# =============================================================================
-# Real-time Transcriber
-# =============================================================================
-
-
 TURN_CHECK_PROMPT = """You are a speech turn-completion classifier. Given a transcript, respond with ONLY one of these markers:
 \u2713 — the utterance is a complete thought or sentence
 \u25cb — short and clearly incomplete (fragment, trailing conjunction, etc.)
@@ -1125,18 +1179,18 @@ class RealtimeTranscriber:
 
     def __init__(
             self,
-            model_path: str = DEFAULT_ASR_MODEL,
-            language: str = DEFAULT_LANGUAGE,
-            transcribe_interval: float = DEFAULT_TRANSCRIBE_INTERVAL,
-            vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
-            min_words: int = DEFAULT_MIN_WORDS,
+            model_path: str = ASR_DEFAULTS.model,
+            language: str = ASR_DEFAULTS.language,
+            transcribe_interval: float = ASR_DEFAULTS.transcribe_interval,
+            vad_silence_ms: int = VAD_DEFAULTS.silence_ms,
+            min_words: int = ASR_DEFAULTS.min_words,
             turn_check: bool = False,
             llm_model: Optional[str] = None,
             device: Optional[int] = None,
             no_ui: bool = False,
-            smart_turn_threshold: float = DEFAULT_SMART_TURN_THRESHOLD,
-            incomplete_short_timeout: float = DEFAULT_INCOMPLETE_SHORT_TIMEOUT,
-            incomplete_long_timeout: float = DEFAULT_INCOMPLETE_LONG_TIMEOUT,
+            smart_turn_threshold: float = SMART_TURN_DEFAULTS.threshold,
+            incomplete_short_timeout: float = SMART_TURN_DEFAULTS.incomplete_short_timeout,
+            incomplete_long_timeout: float = SMART_TURN_DEFAULTS.incomplete_long_timeout,
     ):
         self.model_path = model_path
         self.language = language
@@ -1144,18 +1198,18 @@ class RealtimeTranscriber:
         self.vad_silence_ms = vad_silence_ms
         self.min_words = min_words
         self.turn_check = turn_check
-        self.llm_model_name = llm_model or DEFAULT_LLM_MODEL
+        self.llm_model_name = llm_model or ASR_DEFAULTS.llm_model
         self.device = device
         self.no_ui = no_ui
         self.smart_turn_threshold = smart_turn_threshold
         self.incomplete_short_timeout = incomplete_short_timeout
         self.incomplete_long_timeout = incomplete_long_timeout
 
-        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self.sample_rate = ASR_DEFAULTS.sample_rate
         # Bound RAM and latency by limiting the rolling window.
-        self.max_buffer_seconds = DEFAULT_MAX_BUFFER_SECONDS
+        self.max_buffer_seconds = ASR_DEFAULTS.max_buffer_seconds
 
-        self.audio_queue = asyncio.Queue(maxsize=DEFAULT_AUDIO_QUEUE_MAXSIZE)
+        self.audio_queue = asyncio.Queue(maxsize=ASR_DEFAULTS.audio_queue_maxsize)
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.model = None
@@ -1167,22 +1221,26 @@ class RealtimeTranscriber:
 
         # Ring buffer avoids reallocations; int16 matches the input stream.
         self.max_buffer_samples = int(self.max_buffer_seconds * self.sample_rate)
-        self.audio_buffer = np.zeros(self.max_buffer_samples, dtype=np.int16)
-        self.buffer_write_pos = 0
-        self.buffer_filled = 0
-        self.total_samples_written = 0
+        self.buffer = BufferState(
+            max_samples=self.max_buffer_samples,
+            sample_rate=self.sample_rate,
+            buffer=np.zeros(self.max_buffer_samples, dtype=np.int16),
+        )
         self.last_transcribed_sample = 0
         self.buffer_lock = asyncio.Lock()
 
         # MLX is not re-entrant; serialize GPU work to avoid races.
         self.gpu_lock = asyncio.Lock()
+        self.gpu_cooldown_until = 0.0
 
         self.silero_vad: Optional[SileroVAD] = None  # loaded in run()
         self.vad_frame_samples = SILERO_VAD_WINDOW
-        self.vad_silence_frames = int(math.ceil(self.vad_silence_ms / 32))
-        self.vad_residual = np.array([], dtype=np.int16)
-        self.vad_speech_detected = False
-        self.vad_silence_count = 0
+        vad_silence_frames = int(math.ceil(self.vad_silence_ms / 32))
+        self.vad_state = VADState(
+            frame_samples=self.vad_frame_samples,
+            silence_frames=vad_silence_frames,
+            buffer=np.empty(self.vad_frame_samples * 4, dtype=np.int16),
+        )
         self.frame_size = self.vad_frame_samples
 
         # Track output across updates.
@@ -1199,30 +1257,18 @@ class RealtimeTranscriber:
         self.console_out = Console()
         self.console_ui = Console(stderr=True, force_terminal=True)
         self.live: Optional[Live] = None
-        self.ui_status = "Starting"
-        self.ui_partial = ""
-        self.ui_history: List[str] = []
-        self.ui_max_history = 50
-        self.ui_vad_state = "silence"
-        self.ui_vad_prob: Optional[float] = None
-        self.ui_buffer_seconds = 0.0
-        self.ui_queue_size = 0
-        self.ui_asr_ms: Optional[float] = None
-        self.ui_smart_turn_prob: Optional[float] = None
-        self.ui_smart_turn_ms: Optional[float] = None
-        self.ui_turn_check_result: Optional[str] = None
-        self.ui_wait_remaining: Optional[float] = None
+        self.ui = UIState()
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Keep callback lightweight by deferring work to the async loop."""
         data = indata.reshape(-1).copy()
-        self.loop.call_soon_threadsafe(
-            lambda: (
-                self.audio_queue.put_nowait(data)
-                if not self.audio_queue.full()
-                else None
-            )
-        )
+        def enqueue():
+            if self.audio_queue.full():
+                self.ui.dropped_frames += 1
+                return
+            self.audio_queue.put_nowait(data)
+
+        self.loop.call_soon_threadsafe(enqueue)
 
     def _short_model_name(self, name: Optional[str]) -> str:
         """Render a short model name for UI labels."""
@@ -1233,8 +1279,8 @@ class RealtimeTranscriber:
     def _render_status_panel(self) -> Panel:
         status = Text()
         status.append("Status: ", style="bold")
-        status_style = "green" if self.ui_status == "Listening" else "yellow"
-        status.append(self.ui_status, style=status_style)
+        status_style = "green" if self.ui.status == "Listening" else "yellow"
+        status.append(self.ui.status, style=status_style)
         status.append(" | ")
         status.append(f"Language: {self.language}")
         status.append(" | ")
@@ -1248,13 +1294,13 @@ class RealtimeTranscriber:
 
     def _render_transcript_panel(self) -> Panel:
         body = Text()
-        for transcript in self.ui_history[-self.ui_max_history:]:
+        for transcript in self.ui.history[-self.ui.max_history:]:
             body.append("> ", style="bold green")
             body.append(transcript)
             body.append("\n\n")
-        if self.ui_partial and not self.turn_complete:
+        if self.ui.partial and not self.turn_complete:
             body.append("... ", style="dim")
-            body.append(self.ui_partial, style="dim")
+            body.append(self.ui.partial, style="dim")
             body.append("\n")
         if not body.plain:
             body.append("Waiting for speech...", style="dim")
@@ -1264,30 +1310,35 @@ class RealtimeTranscriber:
         stats = Table.grid(expand=True, padding=(0, 1))
         stats.add_column(justify="right", style="cyan")
         stats.add_column()
-        vad_text = self.ui_vad_state
-        if self.ui_vad_prob is not None:
-            vad_text = f"{self.ui_vad_state} ({self.ui_vad_prob:.0%})"
+        vad_text = self.ui.vad_state
+        if self.ui.vad_prob is not None:
+            vad_text = f"{self.ui.vad_state} ({self.ui.vad_prob:.0%})"
         stats.add_row("VAD", vad_text)
-        stats.add_row("Buffer", f"{self.ui_buffer_seconds:.1f}s")
-        stats.add_row("Queue", str(self.ui_queue_size))
+        stats.add_row("Buffer", f"{self.ui.buffer_seconds:.1f}s")
+        stats.add_row("Queue", str(self.ui.queue_size))
+        stats.add_row("Dropped", str(self.ui.dropped_frames))
         stats.add_row(
             "ASR",
-            f"{self.ui_asr_ms:.0f} ms" if self.ui_asr_ms is not None else "--",
+            f"{self.ui.asr_ms:.0f} ms" if self.ui.asr_ms is not None else "--",
         )
         # Smart Turn stats.
         st_text = "--"
-        if self.ui_smart_turn_prob is not None:
-            prob_pct = self.ui_smart_turn_prob * 100
-            ms_str = f"{self.ui_smart_turn_ms:.0f} ms" if self.ui_smart_turn_ms is not None else ""
+        if self.ui.smart_turn_prob is not None:
+            prob_pct = self.ui.smart_turn_prob * 100
+            ms_str = (
+                f"{self.ui.smart_turn_ms:.0f} ms"
+                if self.ui.smart_turn_ms is not None
+                else ""
+            )
             st_text = f"{prob_pct:.0f}% ({ms_str})"
         stats.add_row("Smart Turn", st_text)
         # Turn check result.
         if self.turn_check:
-            tc_text = self.ui_turn_check_result or "--"
+            tc_text = self.ui.turn_check_result or "--"
             stats.add_row("Turn Check", tc_text)
         # Wait state countdown.
-        if self.ui_wait_remaining is not None:
-            stats.add_row("Wait", f"{self.ui_wait_remaining:.1f}s")
+        if self.ui.wait_remaining is not None:
+            stats.add_row("Wait", f"{self.ui.wait_remaining:.1f}s")
         return Panel(stats, title="Stats", padding=(0, 1))
 
     def _render_ui(self) -> Layout:
@@ -1314,80 +1365,92 @@ class RealtimeTranscriber:
         if frame.size == 0:
             return
         n = frame.size
-        end = self.buffer_write_pos + n
-        if end <= self.max_buffer_samples:
-            self.audio_buffer[self.buffer_write_pos: end] = frame
+        buf = self.buffer
+        end = buf.write_pos + n
+        if end <= buf.max_samples:
+            buf.buffer[buf.write_pos: end] = frame
         else:
-            first = self.max_buffer_samples - self.buffer_write_pos
-            self.audio_buffer[self.buffer_write_pos:] = frame[:first]
-            self.audio_buffer[: end % self.max_buffer_samples] = frame[first:]
-        self.buffer_write_pos = end % self.max_buffer_samples
-        self.buffer_filled = min(self.max_buffer_samples, self.buffer_filled + n)
-        self.total_samples_written += n
-        self.ui_buffer_seconds = self.buffer_filled / self.sample_rate
+            first = buf.max_samples - buf.write_pos
+            buf.buffer[buf.write_pos:] = frame[:first]
+            buf.buffer[: end % buf.max_samples] = frame[first:]
+        buf.write_pos = end % buf.max_samples
+        buf.filled = min(buf.max_samples, buf.filled + n)
+        buf.total_written += n
+        self.ui.buffer_seconds = buf.filled / buf.sample_rate
 
     def _get_recent_audio(self, seconds: float) -> np.ndarray:
         """Provide a sliding window for periodic ASR updates."""
-        if self.buffer_filled == 0:
-            return np.array([], dtype=np.int16)
-        num = min(int(seconds * self.sample_rate), self.buffer_filled)
+        buf = self.buffer
+        if buf.filled == 0:
+            return EMPTY_INT16
+        num = min(int(seconds * buf.sample_rate), buf.filled)
         if num <= 0:
-            return np.array([], dtype=np.int16)
-        start = (self.buffer_write_pos - num) % self.max_buffer_samples
+            return EMPTY_INT16
+        start = (buf.write_pos - num) % buf.max_samples
         end = start + num
-        if end <= self.max_buffer_samples:
-            return self.audio_buffer[start:end].copy()
-        return np.concatenate(
-            [
-                self.audio_buffer[start:],
-                self.audio_buffer[: end % self.max_buffer_samples],
-            ]
-        )
+        out = np.empty(num, dtype=np.int16)
+        if end <= buf.max_samples:
+            out[:] = buf.buffer[start:end]
+            return out
+        first = buf.max_samples - start
+        out[:first] = buf.buffer[start:]
+        out[first:] = buf.buffer[: end % buf.max_samples]
+        return out
 
     def _reset_audio_state(self) -> None:
         """Start a fresh turn so state does not bleed across turns."""
-        self.buffer_write_pos = 0
-        self.buffer_filled = 0
-        self.ui_buffer_seconds = 0.0
-        self.vad_residual = np.array([], dtype=np.int16)
-        self.vad_speech_detected = False
-        self.vad_silence_count = 0
+        self.buffer.write_pos = 0
+        self.buffer.filled = 0
+        self.ui.buffer_seconds = 0.0
+        self.vad_state.buffer_fill = 0
+        self.vad_state.speech_detected = False
+        self.vad_state.silence_count = 0
         if self.silero_vad is not None:
             self.silero_vad.reset()
 
     def _update_vad(self, frame: np.ndarray) -> bool:
         if frame.size == 0:
             return False
-        if self.vad_residual.size == 0:
-            self.vad_residual = frame.copy()
-        else:
-            self.vad_residual = np.concatenate([self.vad_residual, frame])
+        state = self.vad_state
+        if state.buffer_fill + frame.size > state.buffer.size:
+            new_size = max(state.buffer.size * 2, state.buffer_fill + frame.size)
+            new_buf = np.empty(new_size, dtype=np.int16)
+            if state.buffer_fill:
+                new_buf[: state.buffer_fill] = state.buffer[: state.buffer_fill]
+            state.buffer = new_buf
+        state.buffer[state.buffer_fill: state.buffer_fill + frame.size] = frame
+        state.buffer_fill += frame.size
 
         turn_complete = False
-        while self.vad_residual.size >= self.vad_frame_samples:
-            chunk_i16 = self.vad_residual[: self.vad_frame_samples]
-            self.vad_residual = self.vad_residual[self.vad_frame_samples:]
-            chunk_f32 = chunk_i16.astype(np.float32) / 32768.0
+        while state.buffer_fill >= state.frame_samples:
+            chunk_i16 = state.buffer[: state.frame_samples].copy()
+            remaining = state.buffer_fill - state.frame_samples
+            if remaining:
+                state.buffer[:remaining] = state.buffer[
+                    state.frame_samples: state.frame_samples + remaining
+                ]
+            state.buffer_fill = remaining
+            chunk_f32 = _int16_to_float32(chunk_i16)
             prob = self.silero_vad(chunk_f32)
-            self.ui_vad_prob = prob
+            self.ui.vad_prob = prob
             is_speech = prob >= SILERO_VAD_THRESHOLD
             if is_speech:
-                self.ui_vad_state = "speech"
-                self.vad_speech_detected = True
-                self.vad_silence_count = 0
+                self.ui.vad_state = "speech"
+                state.speech_detected = True
+                state.silence_count = 0
                 if self._in_wait_state:
                     self._wait_cancel.set()
-            elif self.vad_speech_detected:
-                self.ui_vad_state = "silence"
-                self.vad_silence_count += 1
-                if self.vad_silence_count >= self.vad_silence_frames:
+            elif state.speech_detected:
+                self.ui.vad_state = "silence"
+                state.silence_count += 1
+                if state.silence_count >= state.silence_frames:
                     turn_complete = True
-                    self.vad_speech_detected = False
-                    self.vad_silence_count = 0
-                    self.vad_residual = np.array([], dtype=np.int16)
+                    state.speech_detected = False
+                    state.silence_count = 0
+                    state.buffer_fill = 0
                     break
             else:
-                self.ui_vad_state = "silence"
+                self.ui.vad_state = "silence"
         return turn_complete
 
     def _transcribe(self, audio: np.ndarray) -> str:
@@ -1441,7 +1504,7 @@ class RealtimeTranscriber:
         """
         self._wait_cancel.clear()
         self._in_wait_state = True
-        self.ui_status = f"Waiting ({timeout:.0f}s)"
+        self.ui.status = f"Waiting ({timeout:.0f}s)"
         self._update_ui()
 
         start = time.monotonic()
@@ -1450,7 +1513,7 @@ class RealtimeTranscriber:
             while True:
                 elapsed = time.monotonic() - start
                 remaining = timeout - elapsed
-                self.ui_wait_remaining = max(0.0, remaining)
+                self.ui.wait_remaining = max(0.0, remaining)
                 self._update_ui()
 
                 if remaining <= 0:
@@ -1467,7 +1530,7 @@ class RealtimeTranscriber:
                     continue
         finally:
             self._in_wait_state = False
-            self.ui_wait_remaining = None
+            self.ui.wait_remaining = None
             self._wait_cancel.clear()
 
     async def _finalize_turn(self, final_transcript: str) -> None:
@@ -1475,109 +1538,121 @@ class RealtimeTranscriber:
         self.pending_turn = final_transcript
         self.last_transcript = final_transcript
         self.current_transcript = ""
-        self.ui_status = "Listening"
+        self.ui.status = "Listening"
 
         async with self.buffer_lock:
             self._reset_audio_state()
 
-        self.last_transcribed_sample = self.total_samples_written
+        self.last_transcribed_sample = self.buffer.total_written
         self.turn_complete = False
+
+    async def _refresh_transcript_for_turn(self) -> None:
+        """Run a quick transcription to support turn-completion checks."""
+        async with self.buffer_lock:
+            audio_int16 = self._get_recent_audio(self.max_buffer_seconds)
+
+        if audio_int16.size < int(self.sample_rate * 0.3):
+            return
+        if self.gpu_lock.locked():
+            return
+        async with self.gpu_lock:
+            audio_float = _int16_to_float32(audio_int16)
+            start = time.perf_counter()
+            text = await asyncio.to_thread(self._transcribe, audio_float)
+            self.ui.asr_ms = (time.perf_counter() - start) * 1000
+        if text:
+            self.current_transcript = text
+
+    def _is_turn_candidate(self) -> bool:
+        """Check whether the current transcript is valid to finalize."""
+        if not self.current_transcript or self.current_transcript == self.last_transcript:
+            return False
+        if not self._is_meaningful(self.current_transcript):
+            return False
+        if len(self.current_transcript.split()) < self.min_words:
+            return False
+        return True
+
+    async def _smart_turn_allows_finalize(self) -> bool:
+        """Run Smart Turn to decide if the speaker has completed a turn."""
+        async with self.buffer_lock:
+            smart_turn_audio = self._get_recent_audio(
+                SMART_TURN_DEFAULTS.audio_seconds
+            )
+        smart_turn_float = _int16_to_float32(smart_turn_audio)
+
+        start = time.perf_counter()
+        result = await asyncio.to_thread(self.smart_turn.predict, smart_turn_float)
+        self.ui.smart_turn_ms = (time.perf_counter() - start) * 1000
+        self.ui.smart_turn_prob = result["probability"]
+        self._update_ui()
+
+        if result["prediction"] == 0:
+            self._log_info(
+                "Smart Turn: incomplete (prob=%.2f), continuing...",
+                result["probability"],
+            )
+            self.vad_state.speech_detected = True
+            self.vad_state.silence_count = 0
+            return False
+
+        self._log_info(
+            "Smart Turn: complete (prob=%.2f)",
+            result["probability"],
+        )
+        return True
+
+    async def _handle_turn_check(self, final_transcript: str) -> bool:
+        """Apply optional LLM turn-checks. Returns True if we should finalize."""
+        if not self.turn_check:
+            return True
+
+        self.ui.status = "Turn Check"
+        self._update_ui()
+
+        async with self.gpu_lock:
+            marker = await asyncio.to_thread(
+                self._check_turn_completion_llm, final_transcript
+            )
+        self.ui.turn_check_result = marker
+        self._update_ui()
+
+        if marker == "\u2713":
+            return True
+        if marker == "\u25cb":
+            timeout = self.incomplete_short_timeout
+        else:
+            timeout = self.incomplete_long_timeout
+
+        self._log_info("Turn check: %s, waiting %.0fs...", marker, timeout)
+        should_finalize = await self._enter_wait_state(timeout)
+
+        if should_finalize:
+            return True
+
+        self._log_info("Wait cancelled — speech resumed")
+        self.turn_complete = False
+        self.ui.status = "Listening"
+        self._update_ui()
+        return False
 
     async def _handle_turn_complete(self) -> None:
         """Process a VAD silence trigger through the smart turn pipeline.
 
         Flow: VAD trigger -> Smart Turn ONNX check -> [LLM turn check] -> finalize
         """
-        # Run a quick transcription to get current text for turn checks.
-        async with self.buffer_lock:
-            audio_int16 = self._get_recent_audio(self.max_buffer_seconds)
+        await self._refresh_transcript_for_turn()
 
-        if audio_int16.size >= int(self.sample_rate * 0.3):
-            if not self.gpu_lock.locked():
-                async with self.gpu_lock:
-                    audio_float = audio_int16.astype(np.float32) / 32768.0
-                    start = time.perf_counter()
-                    text = await asyncio.to_thread(self._transcribe, audio_float)
-                    self.ui_asr_ms = (time.perf_counter() - start) * 1000
-                if text:
-                    self.current_transcript = text
-
-        if (
-                not self.current_transcript
-                or self.current_transcript == self.last_transcript
-        ):
-            return
-        if not self._is_meaningful(self.current_transcript):
-            return
-        if len(self.current_transcript.split()) < self.min_words:
+        if not self._is_turn_candidate():
             return
 
-        # Layer 2: Smart Turn ONNX check on last 8s of audio.
-        async with self.buffer_lock:
-            smart_turn_audio = self._get_recent_audio(SMART_TURN_AUDIO_SECONDS)
-        smart_turn_float = smart_turn_audio.astype(np.float32) / 32768.0
-
-        start = time.perf_counter()
-        result = await asyncio.to_thread(self.smart_turn.predict, smart_turn_float)
-        self.ui_smart_turn_ms = (time.perf_counter() - start) * 1000
-        self.ui_smart_turn_prob = result["probability"]
-        self._update_ui()
-
-        if result["prediction"] == 0:
-            # Smart Turn says incomplete — reset VAD counters, keep listening.
-            self._log_info(
-                "Smart Turn: incomplete (prob=%.2f), continuing...",
-                result["probability"],
-            )
-            self.vad_speech_detected = True
-            self.vad_silence_count = 0
+        if not await self._smart_turn_allows_finalize():
             return
-
-        self._log_info(
-            "Smart Turn: complete (prob=%.2f)",
-            result["probability"],
-        )
 
         self.turn_complete = True
         final_transcript = self.current_transcript
 
-        # Layer 3: Optional LLM turn-check.
-        if self.turn_check:
-            self.ui_status = "Turn Check"
-            self._update_ui()
-
-            async with self.gpu_lock:
-                marker = await asyncio.to_thread(
-                    self._check_turn_completion_llm, final_transcript
-                )
-            self.ui_turn_check_result = marker
-            self._update_ui()
-
-            if marker == "\u2713":
-                # Complete — finalize immediately.
-                await self._finalize_turn(final_transcript)
-                return
-            elif marker == "\u25cb":
-                # Short-incomplete — wait with short timeout.
-                timeout = self.incomplete_short_timeout
-            else:
-                # Long-incomplete (\u25d0) — wait with long timeout.
-                timeout = self.incomplete_long_timeout
-
-            self._log_info("Turn check: %s, waiting %.0fs...", marker, timeout)
-            should_finalize = await self._enter_wait_state(timeout)
-
-            if should_finalize:
-                # Timeout expired without new speech — finalize anyway.
-                await self._finalize_turn(final_transcript)
-            else:
-                # Speech resumed — cancel finalization, keep listening.
-                self._log_info("Wait cancelled — speech resumed")
-                self.turn_complete = False
-                self.ui_status = "Listening"
-                self._update_ui()
-        else:
-            # No LLM check — finalize directly.
+        if await self._handle_turn_check(final_transcript):
             await self._finalize_turn(final_transcript)
 
     async def _processor(self):
@@ -1586,7 +1661,7 @@ class RealtimeTranscriber:
         last_transcribe = self.loop.time()
 
         while True:
-            self.ui_queue_size = self.audio_queue.qsize()
+            self.ui.queue_size = self.audio_queue.qsize()
             frame = None
             try:
                 frame = await asyncio.wait_for(self.audio_queue.get(), timeout=0.05)
@@ -1604,25 +1679,27 @@ class RealtimeTranscriber:
             now = self.loop.time()
             if now - last_transcribe >= self.transcribe_interval:
                 if (
-                        self.total_samples_written - self.last_transcribed_sample
+                        self.buffer.total_written - self.last_transcribed_sample
                         >= min_new_samples
                 ):
                     async with self.buffer_lock:
                         audio_int16 = self._get_recent_audio(self.max_buffer_seconds)
 
                     if audio_int16.size >= int(self.sample_rate * 0.3):
-                        if not self.gpu_lock.locked():
+                        if self.gpu_lock.locked():
+                            self.gpu_cooldown_until = now + GPU_BUSY_COOLDOWN
+                        elif now >= self.gpu_cooldown_until:
                             async with self.gpu_lock:
-                                self.ui_status = "Transcribing"
+                                self.ui.status = "Transcribing"
                                 self._update_ui()
-                                audio = audio_int16.astype(np.float32) / 32768.0
+                                audio = _int16_to_float32(audio_int16)
                                 start = time.perf_counter()
                                 text = await asyncio.to_thread(self._transcribe, audio)
-                                self.ui_asr_ms = (time.perf_counter() - start) * 1000
+                                self.ui.asr_ms = (time.perf_counter() - start) * 1000
                             if text and text != self.current_transcript:
                                 self.current_transcript = text
-                            self.ui_status = "Listening"
-                        self.last_transcribed_sample = self.total_samples_written
+                            self.ui.status = "Listening"
+                        self.last_transcribed_sample = self.buffer.total_written
 
                 last_transcribe = now
 
@@ -1638,8 +1715,8 @@ class RealtimeTranscriber:
                 transcript = self.pending_turn
                 self.pending_turn = None
 
-                self.ui_history.append(transcript)
-                self.ui_partial = ""
+                self.ui.history.append(transcript)
+                self.ui.partial = ""
                 self._update_ui(force=True)
 
                 if not is_tty:
@@ -1654,7 +1731,7 @@ class RealtimeTranscriber:
 
             if self.current_transcript and self._is_meaningful(self.current_transcript):
                 if self.current_transcript != last_displayed and not self.turn_complete:
-                    self.ui_partial = self.current_transcript
+                    self.ui.partial = self.current_transcript
                     if not self.live:
                         if is_tty:
                             width = shutil.get_terminal_size(fallback=(80, 20)).columns - 5
@@ -1682,7 +1759,7 @@ class RealtimeTranscriber:
             )
             self.live.start()
 
-        self.ui_status = "Loading ASR model..."
+        self.ui.status = "Loading ASR model..."
         self._update_ui(force=True)
         self._log_info("Loading ASR model...")
         self.model, self.tokenizer, self.feature_extractor = await asyncio.to_thread(
@@ -1714,7 +1791,7 @@ class RealtimeTranscriber:
         await asyncio.to_thread(warmup)
 
         # Both run on CPU via onnxruntime — no GPU lock needed.
-        self.ui_status = "Loading VAD + Smart Turn models..."
+        self.ui.status = "Loading VAD + Smart Turn models..."
         self._update_ui(force=True)
         self._log_info("Loading Silero VAD model...")
         self.silero_vad = await asyncio.to_thread(SileroVAD)
@@ -1724,7 +1801,7 @@ class RealtimeTranscriber:
         )
 
         if self.turn_check:
-            self.ui_status = "Loading LLM..."
+            self.ui.status = "Loading LLM..."
             self._update_ui(force=True)
             self._log_info("Loading LLM...")
             from mlx_lm.utils import load as load_llm
@@ -1752,7 +1829,7 @@ class RealtimeTranscriber:
             info += " | Turn Check: enabled"
         self._log_info("Ready - %s", info)
         self._log_info("Listening... (Ctrl+C to stop)")
-        self.ui_status = "Listening"
+        self.ui.status = "Listening"
         self._update_ui(force=True)
 
         stream.start()
@@ -1806,41 +1883,48 @@ class RealtimeTranscriber:
                 self.live.stop()
 
 
-# =============================================================================
-# Main
-# =============================================================================
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
+def _build_arg_parser() -> argparse.ArgumentParser:
     """Separate CLI configuration for reuse and testability."""
     parser = argparse.ArgumentParser(
         description="Speech transcription with smart turn detection (VAD + ONNX + optional LLM)"
     )
-    parser.add_argument("--model", default=DEFAULT_ASR_MODEL, help="ASR model")
-    parser.add_argument("--language", default=DEFAULT_LANGUAGE, help="Language")
+    parser.add_argument("--model", default=ASR_DEFAULTS.model, help="ASR model")
+    parser.add_argument("--language", default=ASR_DEFAULTS.language, help="Language")
     parser.add_argument(
         "--transcribe-interval",
         type=float,
-        default=DEFAULT_TRANSCRIBE_INTERVAL,
-        help=f"How often to update transcription (default: {DEFAULT_TRANSCRIBE_INTERVAL}s)",
+        default=ASR_DEFAULTS.transcribe_interval,
+        help=(
+            "How often to update transcription "
+            f"(default: {ASR_DEFAULTS.transcribe_interval}s)"
+        ),
     )
     parser.add_argument(
         "--vad-silence-ms",
         type=int,
-        default=DEFAULT_VAD_SILENCE_MS,
-        help=f"Silence to trigger smart turn check (default: {DEFAULT_VAD_SILENCE_MS}ms)",
+        default=VAD_DEFAULTS.silence_ms,
+        help=(
+            "Silence to trigger smart turn check "
+            f"(default: {VAD_DEFAULTS.silence_ms}ms)"
+        ),
     )
     parser.add_argument(
         "--min-words",
         type=int,
-        default=DEFAULT_MIN_WORDS,
-        help=f"Minimum words to finalize a turn (default: {DEFAULT_MIN_WORDS})",
+        default=ASR_DEFAULTS.min_words,
+        help=(
+            "Minimum words to finalize a turn "
+            f"(default: {ASR_DEFAULTS.min_words})"
+        ),
     )
     parser.add_argument(
         "--smart-turn-threshold",
         type=float,
-        default=DEFAULT_SMART_TURN_THRESHOLD,
-        help=f"Smart Turn probability threshold (default: {DEFAULT_SMART_TURN_THRESHOLD})",
+        default=SMART_TURN_DEFAULTS.threshold,
+        help=(
+            "Smart Turn probability threshold "
+            f"(default: {SMART_TURN_DEFAULTS.threshold})"
+        ),
     )
     parser.add_argument(
         "--turn-check",
@@ -1850,14 +1934,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--incomplete-short-timeout",
         type=float,
-        default=DEFAULT_INCOMPLETE_SHORT_TIMEOUT,
-        help=f"Wait time for short-incomplete turns (default: {DEFAULT_INCOMPLETE_SHORT_TIMEOUT}s)",
+        default=SMART_TURN_DEFAULTS.incomplete_short_timeout,
+        help=(
+            "Wait time for short-incomplete turns "
+            f"(default: {SMART_TURN_DEFAULTS.incomplete_short_timeout}s)"
+        ),
     )
     parser.add_argument(
         "--incomplete-long-timeout",
         type=float,
-        default=DEFAULT_INCOMPLETE_LONG_TIMEOUT,
-        help=f"Wait time for long-incomplete turns (default: {DEFAULT_INCOMPLETE_LONG_TIMEOUT}s)",
+        default=SMART_TURN_DEFAULTS.incomplete_long_timeout,
+        help=(
+            "Wait time for long-incomplete turns "
+            f"(default: {SMART_TURN_DEFAULTS.incomplete_long_timeout}s)"
+        ),
     )
     parser.add_argument("--llm-model", default=None, help="LLM model for turn-check")
     parser.add_argument(
@@ -1870,7 +1960,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def list_audio_devices() -> None:
+def _list_audio_devices() -> None:
     """Allow device discovery without running the ASR pipeline."""
     console = Console()
     table = Table(title="Audio Input Devices")
@@ -1884,7 +1974,7 @@ def list_audio_devices() -> None:
     console.print(table)
 
 
-def main() -> int:
+def _main() -> int:
     """Provide a CLI entry that returns an exit code."""
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -1902,11 +1992,11 @@ def main() -> int:
     # Silence chatty HTTP request logs from model downloads.
     logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    parser = build_arg_parser()
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     if args.list_devices:
-        list_audio_devices()
+        _list_audio_devices()
         return 0
 
     transcriber = RealtimeTranscriber(
