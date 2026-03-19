@@ -90,7 +90,7 @@ if hasattr(mx, "set_warnings_enabled"):
 import mlx.nn as nn  # noqa: E402
 import numpy as np  # noqa: E402
 import sounddevice as sd  # noqa: E402
-import webrtcvad  # noqa: E402
+import webrtcvad_compat as webrtcvad  # noqa: E402
 
 from huggingface_hub import snapshot_download  # noqa: E402
 from rich.console import Console  # noqa: E402
